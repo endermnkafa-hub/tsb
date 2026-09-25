@@ -343,9 +343,45 @@ function Components.Dropdown(parent: Instance, title: string, options: { string 
     local isOpen = false
     local currentSelected = defaultSelected
 
+    local function RebuildOptions(opts: { string })
+        for _, child in ipairs(listFrame:GetChildren()) do
+            if child:IsA("TextButton") then
+                child:Destroy()
+            end
+        end
+        listFrame.Size = UDim2.new(1, -24, 0, #opts * 26)
+
+        for idx, opt in ipairs(opts) do
+            local optBtn = Instance.new("TextButton")
+            optBtn.Size = UDim2.new(1, 0, 0, 26)
+            optBtn.BackgroundColor3 = Theme.Colors.Header
+            optBtn.BorderSizePixel = 0
+            optBtn.Text = "  " .. opt
+            optBtn.TextColor3 = (opt == currentSelected) and accent.Primary or Theme.Colors.TextSecondary
+            optBtn.TextSize = 11
+            optBtn.Font = Theme.Fonts.Body
+            optBtn.TextXAlignment = Enum.TextXAlignment.Left
+            optBtn.LayoutOrder = idx
+            optBtn.Parent = listFrame
+            Instance.new("UICorner", optBtn).CornerRadius = UDim.new(0, 4)
+
+            optBtn.MouseEnter:Connect(function()
+                Theme.Tween(optBtn, 0.1, { BackgroundColor3 = Theme.Colors.CardHover, TextColor3 = Theme.Colors.TextPrimary })
+            end)
+            optBtn.MouseLeave:Connect(function()
+                local isSel = (opt == currentSelected)
+                Theme.Tween(optBtn, 0.1, { BackgroundColor3 = Theme.Colors.Header, TextColor3 = isSel and accent.Primary or Theme.Colors.TextSecondary })
+            end)
+            optBtn.MouseButton1Click:Connect(function()
+                SelectOption(opt)
+            end)
+        end
+    end
+
+    local currentOpts = options
     local function ToggleOpen()
         isOpen = not isOpen
-        local targetH = isOpen and (48 + #options * 28) or 42
+        local targetH = isOpen and (48 + #currentOpts * 28) or 42
         arrow.Text = isOpen and "▲" or "▼"
         Theme.Tween(frame, 0.18, { Size = UDim2.new(1, 0, 0, targetH) })
     end
@@ -359,37 +395,22 @@ function Components.Dropdown(parent: Instance, title: string, options: { string 
         end
     end
 
-    for idx, opt in ipairs(options) do
-        local optBtn = Instance.new("TextButton")
-        optBtn.Size = UDim2.new(1, 0, 0, 26)
-        optBtn.BackgroundColor3 = Theme.Colors.Header
-        optBtn.BorderSizePixel = 0
-        optBtn.Text = "  " .. opt
-        optBtn.TextColor3 = (opt == currentSelected) and accent.Primary or Theme.Colors.TextSecondary
-        optBtn.TextSize = 11
-        optBtn.Font = Theme.Fonts.Body
-        optBtn.TextXAlignment = Enum.TextXAlignment.Left
-        optBtn.LayoutOrder = idx
-        optBtn.Parent = listFrame
-        Instance.new("UICorner", optBtn).CornerRadius = UDim.new(0, 4)
-
-        optBtn.MouseEnter:Connect(function()
-            Theme.Tween(optBtn, 0.1, { BackgroundColor3 = Theme.Colors.CardHover, TextColor3 = Theme.Colors.TextPrimary })
-        end)
-        optBtn.MouseLeave:Connect(function()
-            local isSel = (opt == currentSelected)
-            Theme.Tween(optBtn, 0.1, { BackgroundColor3 = Theme.Colors.Header, TextColor3 = isSel and accent.Primary or Theme.Colors.TextSecondary })
-        end)
-        optBtn.MouseButton1Click:Connect(function()
-            SelectOption(opt)
-        end)
+    local function SetOptions(newOpts: { string })
+        currentOpts = newOpts
+        RebuildOptions(newOpts)
+        if isOpen then
+            local targetH = 48 + #newOpts * 28
+            Theme.Tween(frame, 0.18, { Size = UDim2.new(1, 0, 0, targetH) })
+        end
     end
 
+    RebuildOptions(options)
     selectBtn.MouseButton1Click:Connect(ToggleOpen)
 
     return {
         Frame = frame,
         Select = SelectOption,
+        SetOptions = SetOptions,
         GetSelected = function() return currentSelected end,
     }
 end

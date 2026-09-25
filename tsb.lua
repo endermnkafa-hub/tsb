@@ -781,6 +781,8 @@ function Bootstrap:Init()
             combat:UpdateAutoM1(configManager.Config)
             combat:UpdateAutoBlock(configManager.Config)
             combat:UpdateHitboxExpander(configManager.Config)
+            combat:UpdateAutoEvasive(configManager.Config)
+            combat:UpdateMassBring(configManager.Config)
             movement:UpdateBehindLock(dt, configManager.Config, combat)
         end
     })
@@ -790,11 +792,12 @@ function Bootstrap:Init()
         Phase = "Heartbeat",
         Priority = 90,
         Budget = 1.0,
-        Dependencies = { "Movement" },
+        Dependencies = { "Movement", "Combat" },
         Enabled = true,
         Update = function(self, dt, ctx)
             movement:UpdateSpeed(dt, configManager.Config)
             movement:UpdateAntiVoid(configManager.Config)
+            combat:UpdateAntiRagdoll(configManager.Config)
         end
     })
 
@@ -807,6 +810,7 @@ function Bootstrap:Init()
         Enabled = true,
         Update = function(self, dt, ctx)
             skills:UpdateAutoSkillSpam(configManager.Config)
+            skills:UpdateVoidKill(configManager.Config)
         end
     })
 
@@ -1203,6 +1207,11 @@ local ConfigSchema = {
         RecordAnimations   = { Type = "boolean", Default = true },
         RecordAttributes   = { Type = "boolean", Default = true },
         RecordCooldowns    = { Type = "boolean", Default = true },
+        RecordSounds       = { Type = "boolean", Default = true },
+        RecordTools        = { Type = "boolean", Default = true },
+        RecordRemotes      = { Type = "boolean", Default = true },
+        RecordCorrelations = { Type = "boolean", Default = true },
+        MaxCombatEvents    = { Type = "number",  Default = 1000, Min = 100, Max = 5000 },
     },
     Keybinds = {
         ToggleGUI          = { Type = "EnumItem", EnumType = Enum.KeyCode, Default = Enum.KeyCode.RightControl },
@@ -2572,6 +2581,15 @@ function Profiler:UpdateSystemMetrics()
     end
 end
 
+function Profiler:GetReport(): { [string]: any }
+    return {
+        FPS = self.CurrentFPS,
+        MemoryKB = self.MemoryKB,
+        PingMS = self.PingMS,
+        Metrics = self.Metrics,
+    }
+end
+
 return Profiler
 
 end
@@ -2771,6 +2789,11 @@ function Combat:UpdateAutoM1(config: any)
     local tEntry = self._cache:GetPlayerEntry(target)
     if not myEntry or not myEntry.RootPart or not tEntry or not tEntry.RootPart then return end
 
+    -- AntiCounterBait: don't attack while enemy is in counter stance
+    if config.Combat.AntiCounterBait and self._enemyState:IsEnemyInCounterStance(target) then
+        return
+    end
+
     local dist = (myEntry.RootPart.Position - tEntry.RootPart.Position).Magnitude
     if dist <= 14 then
         -- Natural FSM State Management
@@ -2779,9 +2802,36 @@ function Combat:UpdateAutoM1(config: any)
         end
 
         local now = os.clock()
+        local enemyData = self._enemyState and self._enemyState:Get(target)
+
+        -- Frame Trap Wakeup: if enemy is ragdolled, wait for the exact getup recovery frame
+        if enemyData and enemyData.IsRagdoll then
+            if config.Combat.FrameTrapWakeup and enemyData.WakeupTime > 0 then
+                if now >= (enemyData.WakeupTime - 0.15) and now <= (enemyData.WakeupTime + 0.35) then
+                    if (now - self.LastAttackTick) >= (config.Combat.AutoM1Delay or 0.12) then
+                        self.LastAttackTick = now
+                        self.M1ComboCount = 1
+                        SafeMouseClick()
+                    end
+                end
+            end
+            return -- Do not waste attacks while enemy is invincible on ground
+        end
+
         if (now - self.LastAttackTick) >= (config.Combat.AutoM1Delay or 0.12) then
             self.LastAttackTick = now
             self.M1ComboCount = (self.M1ComboCount % 4) + 1
+
+            -- AutoComboSequencer: execute combo timings (e.g. 3 M1s + pause / skill window)
+            if config.Combat.AutoComboSequencer and self.M1ComboCount == 3 then
+                -- 3rd M1 executed; delay 4th slightly or trigger downtilt/uptilt jump
+                pcall(function()
+                    if myEntry.Humanoid then
+                        myEntry.Humanoid.Jump = true
+                    end
+                end)
+            end
+
             SafeMouseClick()
         end
     end
@@ -2877,6 +2927,117 @@ function Combat:ResetHitboxes()
                 end)
             end
         end
+    end
+end
+
+function Combat:UpdateAntiRagdoll(config: any)
+    if not config.Combat.AntiRagdoll then return end
+    local entry = self._cache:GetPlayerEntry(LocalPlayer)
+    if not entry or not entry.Humanoid then return end
+    local state = entry.Humanoid:GetState()
+    if state == Enum.HumanoidStateType.Physics or state == Enum.HumanoidStateType.FallingDown then
+        pcall(function() entry.Humanoid:ChangeState(Enum.HumanoidStateType.Running) end)
+    end
+end
+
+function Combat:UpdateAutoEvasive(config: any)
+    if not config.Combat.AutoEvasive then return end
+    local myEntry = self._cache:GetPlayerEntry(LocalPlayer)
+    if not myEntry or not myEntry.RootPart then return end
+    local myPos = myEntry.RootPart.Position
+    local cam = game:GetService("Workspace").CurrentCamera
+    if not cam then return end
+
+    local now = os.clock()
+    if (now - (self._lastEvasiveTick or 0)) < 0.5 then return end
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player == LocalPlayer then continue end
+        local tEntry = self._cache:GetPlayerEntry(player)
+        if not tEntry or not tEntry.IsAlive or not tEntry.RootPart then continue end
+        local dist = (tEntry.RootPart.Position - myPos).Magnitude
+        if dist > 12 then continue end
+
+        -- Check if enemy is actively attacking
+        local isAttacking = false
+        local tChar = tEntry.Character
+        if tChar then
+            if tChar:GetAttribute("HoldingM1") or tChar:GetAttribute("HoldingNormalPunch")
+                or tChar:GetAttribute("HoldingConsecutivePunches") then
+                isAttacking = true
+            end
+        end
+        if not isAttacking and tEntry.Animator then
+            for _, track in ipairs(tEntry.Animator:GetPlayingAnimationTracks()) do
+                local name = (track.Name or ""):lower()
+                if name:find("attack") or name:find("punch") or name:find("strike") then
+                    isAttacking = true
+                    break
+                end
+            end
+        end
+
+        if isAttacking then
+            self._lastEvasiveTick = now
+            -- Alternate dodge direction each time
+            self._evasiveSide = not self._evasiveSide
+            local sideDir = self._evasiveSide and cam.CFrame.RightVector or -cam.CFrame.RightVector
+            pcall(function()
+                myEntry.RootPart.AssemblyLinearVelocity = Vector3.new(
+                    sideDir.X * 40,
+                    myEntry.RootPart.AssemblyLinearVelocity.Y,
+                    sideDir.Z * 40
+                )
+            end)
+            break
+        end
+    end
+end
+
+function Combat:StartMassBring(config: any)
+    if self.MassBringActive then return end
+    self.MassBringActive = true
+    self._massBringStart = os.clock()
+    self._eventBus:Publish("Combat.MassBringStarted")
+end
+
+function Combat:StopMassBring()
+    if not self.MassBringActive then return end
+    self.MassBringActive = false
+    self._massBringStart = nil
+    self._eventBus:Publish("Combat.MassBringStopped")
+end
+
+function Combat:UpdateMassBring(config: any)
+    if not self.MassBringActive then return end
+    local myEntry = self._cache:GetPlayerEntry(LocalPlayer)
+    if not myEntry or not myEntry.RootPart then self:StopMassBring() return end
+
+    -- Auto-stop after duration
+    local duration = config.Combat.MassBringDuration or 5
+    if (os.clock() - (self._massBringStart or 0)) > duration then
+        self:StopMassBring()
+        return
+    end
+
+    local myPos = myEntry.RootPart.Position
+    local radius = 6
+    local idx = 0
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player == LocalPlayer then continue end
+        local tEntry = self._cache:GetPlayerEntry(player)
+        if not tEntry or not tEntry.IsAlive or not tEntry.RootPart then continue end
+        local dist = (tEntry.RootPart.Position - myPos).Magnitude
+        if dist > (config.Combat.AimMaxRange or 300) then continue end
+
+        -- Arrange players in a circle around local player
+        local angle = (idx * (2 * math.pi)) / math.max(#Players:GetPlayers() - 1, 1)
+        local targetPos = myPos + Vector3.new(math.cos(angle) * radius, 0, math.sin(angle) * radius)
+        pcall(function()
+            tEntry.RootPart.CFrame = CFrame.new(targetPos + Vector3.new(0, 3, 0))
+        end)
+        idx += 1
     end
 end
 
@@ -3100,10 +3261,21 @@ function Movement:UpdateFly(dt: number, config: any)
     if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then moveDir -= Vector3.new(0, 1, 0) end
 
     local root = entry.RootPart
-    root.AssemblyLinearVelocity = Vector3.zero
     root.AssemblyAngularVelocity = Vector3.zero
-    if moveDir.Magnitude > 0 then
-        root.CFrame = root.CFrame + (moveDir.Unit * speed * (dt or 0.016))
+
+    if config.Movement.FlyMode == "Velocity" then
+        -- Physics-based velocity flight (smoother, less warpy)
+        if moveDir.Magnitude > 0 then
+            root.AssemblyLinearVelocity = moveDir.Unit * speed
+        else
+            root.AssemblyLinearVelocity = root.AssemblyLinearVelocity * 0.85 -- dampen
+        end
+    else
+        -- CFrame-based flight (default, precise)
+        root.AssemblyLinearVelocity = Vector3.zero
+        if moveDir.Magnitude > 0 then
+            root.CFrame = root.CFrame + (moveDir.Unit * speed * (dt or 0.016))
+        end
     end
 end
 
@@ -3468,6 +3640,38 @@ function Skills:UpdateAutoSkillSpam(config: any)
     end
 end
 
+function Skills:UpdateVoidKill(config: any)
+    if not config.Skills.VoidKill then return end
+    local target = self._combat.CurrentTarget or self._combat:GetTarget(config)
+    if not target then return end
+
+    local tEntry = self._cache:GetPlayerEntry(target)
+    if not tEntry or not tEntry.IsAlive or not tEntry.RootPart then return end
+
+    -- Throttle: only trigger once every 3 seconds
+    local now = os.clock()
+    if (now - (self._lastVoidKillTick or 0)) < 3 then return end
+    self._lastVoidKillTick = now
+
+    local root = tEntry.RootPart
+    local originalCFrame = root.CFrame
+    local voidDepth = config.Skills.VoidDepth or -350
+
+    pcall(function()
+        root.CFrame = CFrame.new(originalCFrame.Position.X, voidDepth, originalCFrame.Position.Z)
+    end)
+
+    local returnDelay = config.Skills.VoidReturnDelay or 0.5
+    task.delay(returnDelay, function()
+        pcall(function()
+            -- Only return if still in void and still alive
+            if root and root.Parent and root.Position.Y < -100 then
+                root.CFrame = originalCFrame
+            end
+        end)
+    end)
+end
+
 return Skills
 
 end
@@ -3610,524 +3814,944 @@ __modules["Systems/Survival"] = __modules["Systems.Survival"]
 -- ============================================================================
 __modules["Systems.TelemetryRecorder"] = function()
 --!strict
-local Players = game:GetService("Players")
+-- =============================================================================
+-- TelemetryRecorder v10.0 — Comprehensive Multi-Category Data Collector
+-- Normalized, deduplicated, multi-file persistent dataset for all players.
+-- =============================================================================
+local Players    = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local LocalPlayer = Players.LocalPlayer
 
 local TelemetryRecorder = {}
 TelemetryRecorder.__index = TelemetryRecorder
 
-export type TelemetryStats = {
-    TotalAnimations: number,
-    TotalAttributes: number,
-    TotalEvents: number,
-    TotalHitboxProfiles: number,
-    TotalCooldownProfiles: number,
-    TotalSounds: number,
-    TotalRemotes: number,
-    LastSaved: number,
-    IsRecording: boolean,
-}
+-- ============================================================================
+-- HELPERS
+-- ============================================================================
+local function countKeys(t: any): number
+    local n = 0
+    for _ in pairs(t) do n += 1 end
+    return n
+end
 
-function TelemetryRecorder.new(deps: { Cache: any, EventBus: any, Logger: any })
+local function setAdd(s: {[string]: boolean}, val: string)
+    s[val] = true
+end
+
+local function isBehavioral(name: string): boolean
+    local n = name:lower()
+    return n:find("holding") ~= nil
+        or n:find("blocking") ~= nil
+        or n:find("skill") ~= nil
+        or n:find("ulted") ~= nil
+        or n:find("state") ~= nil
+        or n:find("counter") ~= nil
+        or n:find("dash") ~= nil
+        or n:find("hurt") ~= nil
+        or n:find("ragdoll") ~= nil
+        or n:find("stun") ~= nil
+end
+
+local function getCharType(char: any): string
+    if char then
+        local attr = char:GetAttribute("Character")
+        if type(attr) == "string" and #attr > 0 then return attr end
+        return char.Name or "Unknown"
+    end
+    return "Unknown"
+end
+
+local function getRigType(char: any): string
+    if char and char:FindFirstChild("UpperTorso") then
+        return "R15"
+    end
+    return "R6"
+end
+
+local function getPath(inst: Instance): string
+    local parts = {}
+    local cur: Instance? = inst
+    while cur and cur ~= game do
+        table.insert(parts, 1, cur.Name)
+        cur = cur.Parent
+    end
+    return table.concat(parts, ".")
+end
+
+local function JSONEncode(data: any): string
+    local ok, result = pcall(function() return HttpService:JSONEncode(data) end)
+    if ok then return result end
+    return "{}"
+end
+
+local function JSONDecode(raw: string): any
+    local ok, result = pcall(function() return HttpService:JSONDecode(raw) end)
+    if ok then return result end
+    return nil
+end
+
+local function safeReadFile(path: string): string?
+    local ok, result = pcall(function()
+        if isfile and isfile(path) then
+            return readfile(path)
+        end
+    end)
+    if ok then return result end
+    return nil
+end
+
+local function safeWriteFile(path: string, content: string)
+    pcall(function()
+        if writefile then writefile(path, content) end
+    end)
+end
+
+local function safeMakeFolder(path: string)
+    pcall(function()
+        if makefolder then makefolder(path) end
+    end)
+end
+
+-- ============================================================================
+-- CONSTRUCTOR
+-- ============================================================================
+function TelemetryRecorder.new(deps: { Logger: any, EventBus: any })
     local self = setmetatable({
-        _cache = deps.Cache,
-        _eventBus = deps.EventBus,
-        _logger = deps.Logger,
-        _isDirty = false,
-        _lastSaveTick = os.clock(),
-        _connections = {} :: { [string]: any },
-        _playerTrackers = {} :: { [Player]: any },
-        _notifThrottle = {} :: { [string]: number },
-        
-        -- Master Accumulated Combat Telemetry Database
-        Data = {
-            Metadata = {
-                FrameworkVersion = "9.0-SPECIALIST-PRODUCTION",
-                Created = os.time(),
-                LastUpdated = os.time(),
-                TotalSessions = 1,
-            },
-            Animations = {} :: { [string]: any },
-            Attributes = {} :: { [string]: any },
-            HitboxProfiles = {} :: { [string]: any },
-            Cooldowns = {} :: { [string]: any },
-            Sounds = {} :: { [string]: any },
-            Remotes = {} :: { [string]: any },
-            Events = {} :: { any },
-        },
-    }, TelemetryRecorder)
+        _logger    = deps.Logger,
+        _eventBus  = deps.EventBus,
 
-    -- Load existing persistent dataset
-    self:LoadFromDisk()
-    self:ScanRemotes()
-    self:InitHooks()
+        -- Multi-category normalized data store
+        Data = {
+            Meta = {
+                Version           = "10.0",
+                Created           = os.time(),
+                LastUpdated       = os.time(),
+                TotalSessions     = 1,
+                FrameworkVersion  = "9.0-SPECIALIST-PRODUCTION",
+            },
+            Animations    = {},
+            Characters    = {},
+            Hitboxes      = {},
+            Attributes    = {},
+            Correlations  = {},
+            CombatEvents  = {},  -- ring buffer
+            Cooldowns     = {},
+            Sounds        = {},
+            Tools         = {},
+            Remotes       = {},
+            World         = {},
+        },
+
+        _connections      = {},
+        _playerTrackers   = {},  -- per-player state for correlation/cooldown
+        _notifThrottle    = {},  -- key → last notif time
+        _isDirty          = false,
+        _lastSaveTick     = 0,
+        _sessionStart     = os.clock(),
+        _isRecording      = false,
+        _maxCombatEvents  = 1000,  -- overwritten from config in Update
+        _lastRemoteScan   = 0,
+    }, TelemetryRecorder)
 
     return self
 end
 
-function TelemetryRecorder:SendNotification(title: string, message: string, kind: string?)
+-- ============================================================================
+-- NOTIFICATION THROTTLE
+-- ============================================================================
+function TelemetryRecorder:SendNotification(key: string, title: string, msg: string, duration: number?, kind: any?)
     local now = os.clock()
-    local key = title .. ":" .. message:sub(1, 20)
-    if self._notifThrottle[key] and (now - self._notifThrottle[key]) < 2.0 then
-        return
-    end
+    if (now - (self._notifThrottle[key] or 0)) < 2 then return end
     self._notifThrottle[key] = now
-
-    pcall(function()
-        if self._eventBus then
-            self._eventBus:Publish("Notification.Show", title, message, 2.5, kind or "Info")
-        end
-    end)
+    self._eventBus:Publish("Notification.Show", title, msg, duration or 3.0, kind or "Info")
 end
 
-function TelemetryRecorder:LoadFromDisk()
-    pcall(function()
-        if typeof(readfile) == "function" and typeof(isfile) == "function" then
-            if isfile("tsb_combat_data.json") then
-                local content = readfile("tsb_combat_data.json")
-                if content and #content > 5 then
-                    local parsed = HttpService:JSONDecode(content)
-                    if typeof(parsed) == "table" then
-                        if parsed.Animations and typeof(parsed.Animations) == "table" then
-                            for k, v in pairs(parsed.Animations) do
-                                if typeof(v) == "table" then
-                                    self.Data.Animations[k] = v
-                                else
-                                    self.Data.Animations[k] = { Id = tostring(k), Name = tostring(v), Count = 1, FirstSeen = os.time() }
-                                end
-                            end
-                        end
-                        if parsed.Attributes and typeof(parsed.Attributes) == "table" then
-                            for k, v in pairs(parsed.Attributes) do
-                                if typeof(v) == "table" then
-                                    self.Data.Attributes[k] = v
-                                else
-                                    self.Data.Attributes[k] = { Name = tostring(k), SampleValues = { [tostring(v)] = true }, Count = 1, FirstSeen = os.time(), LastPlayer = "Legacy" }
-                                end
-                            end
-                        end
-                        if parsed.HitboxProfiles and typeof(parsed.HitboxProfiles) == "table" then
-                            for k, v in pairs(parsed.HitboxProfiles) do if typeof(v) == "table" then self.Data.HitboxProfiles[k] = v end end
-                        end
-                        if parsed.Cooldowns and typeof(parsed.Cooldowns) == "table" then
-                            for k, v in pairs(parsed.Cooldowns) do if typeof(v) == "table" then self.Data.Cooldowns[k] = v end end
-                        end
-                        if parsed.Sounds and typeof(parsed.Sounds) == "table" then
-                            for k, v in pairs(parsed.Sounds) do if typeof(v) == "table" then self.Data.Sounds[k] = v end end
-                        end
-                        if parsed.Remotes and typeof(parsed.Remotes) == "table" then
-                            for k, v in pairs(parsed.Remotes) do if typeof(v) == "table" then self.Data.Remotes[k] = v end end
-                        end
-                        if parsed.Metadata and typeof(parsed.Metadata) == "table" and typeof(parsed.Metadata.TotalSessions) == "number" then
-                            self.Data.Metadata.TotalSessions = parsed.Metadata.TotalSessions + 1
-                        end
-                        self._logger:Info("TelemetryRecorder", string.format("Loaded existing data: %d anims, %d attrs from tsb_combat_data.json", self:CountKeys(self.Data.Animations), self:CountKeys(self.Data.Attributes)))
-                    end
-                end
-            end
-        end
-    end)
-end
+-- ============================================================================
+-- ANIMATION RECORDING
+-- ============================================================================
+function TelemetryRecorder:RecordAnimation(track: AnimationTrack, player: Player, char: any)
+    if not track or not track.Animation then return end
+    local animId = tostring(track.Animation.AnimationId or "")
+    if animId == "" or animId == "0" then return end
 
-function TelemetryRecorder:CountKeys(tbl: any): number
-    if typeof(tbl) ~= "table" then return 0 end
-    local c = 0
-    for _ in pairs(tbl) do c += 1 end
-    return c
-end
+    local charType = getCharType(char)
+    local playerName = player.Name
 
-function TelemetryRecorder:SaveToDisk(force: boolean?)
-    if not self._isDirty and not force then return end
-    self._isDirty = false
-    self._lastSaveTick = os.clock()
-    self.Data.Metadata.LastUpdated = os.time()
-
-    pcall(function()
-        if typeof(writefile) == "function" then
-            local encoded = HttpService:JSONEncode(self.Data)
-            writefile("tsb_combat_data.json", encoded)
-            self._logger:Info("TelemetryRecorder", string.format("Saved combat telemetry (%d anims, %d attrs, %d events) to tsb_combat_data.json", self:CountKeys(self.Data.Animations), self:CountKeys(self.Data.Attributes), #self.Data.Events))
-        end
-    end)
-end
-
-function TelemetryRecorder:RecordAnimation(animTrack: AnimationTrack, player: Player)
-    if not animTrack then return end
-    local anim = animTrack.Animation
-    local animId = anim and anim.AnimationId or ""
-    local cleanId = animId:match("%d+") or animTrack.Name or "Unknown"
-
-    local existing = self.Data.Animations[cleanId]
-    local now = os.clock()
-
-    if not existing or typeof(existing) ~= "table" then
-        local keyframeNames = {}
-        pcall(function()
-            if animTrack.GetTimeOfKeyframe then
-                for _, name in ipairs({ "hit", "strike", "damage", "parry", "counter", "block", "release", "fire", "slam", "kick" }) do
-                    local t = animTrack:GetTimeOfKeyframe(name)
-                    if t and t > 0 then
-                        keyframeNames[name] = t
-                    end
-                end
-            end
-        end)
-
-        local trackName = animTrack.Name or "Unnamed"
-        self.Data.Animations[cleanId] = {
-            Id = cleanId,
-            RawUrl = animId,
-            Name = trackName,
-            Length = animTrack.Length or 0,
-            Speed = animTrack.Speed or 1,
-            Priority = tostring(animTrack.Priority),
-            Keyframes = keyframeNames,
-            DiscoveredBy = player.Name,
-            FirstSeen = os.time(),
-            Count = 1,
-            LastUsed = now,
+    local now = os.time()
+    local record = self.Data.Animations[animId]
+    if not record then
+        record = {
+            Id              = animId,
+            RawUrl          = animId,
+            Name            = track.Name or "",
+            Length          = track.Length or 0,
+            Priority        = tostring(track.Priority or ""),
+            Looped          = track.Looped or false,
+            Speed           = track.Speed or 1,
+            FirstSeen       = now,
+            LastSeen        = now,
+            PlayCount       = 0,
+            TotalPlaytime   = 0,
+            PlayersSeen     = {},
+            CharactersSeen  = {},
         }
-        self._isDirty = true
-
-        -- Live Toast Notification
-        self:SendNotification("🔔 Yeni Animasyon", string.format("%s: %s (ID: %s)", player.Name, trackName, cleanId), "Success")
-    else
-        existing.Count = (tonumber(existing.Count) or 1) + 1
-        existing.LastUsed = now
-        self._isDirty = true
-    end
-end
-
-function TelemetryRecorder:RecordAttribute(attrName: string, value: any, player: Player)
-    if not attrName then return end
-    local existing = self.Data.Attributes[attrName]
-    local valStr = tostring(value)
-
-    if not existing or typeof(existing) ~= "table" then
-        self.Data.Attributes[attrName] = {
-            Name = attrName,
-            FirstSeen = os.time(),
-            SampleValues = { [valStr] = true },
-            Count = 1,
-            LastPlayer = player.Name,
-        }
-        self._isDirty = true
-
-        -- Live Toast Notification
-        self:SendNotification("⚡ Yeni Oyun Özelliği", string.format("%s -> %s = %s", player.Name, attrName, valStr), "Info")
-    else
-        existing.Count = (tonumber(existing.Count) or 1) + 1
-        if not existing.SampleValues or typeof(existing.SampleValues) ~= "table" then
-            existing.SampleValues = {}
-        end
-        existing.SampleValues[valStr] = true
-        existing.LastPlayer = player.Name
-        self._isDirty = true
-    end
-end
-
-function TelemetryRecorder:RecordHitboxProfile(char: Model, player: Player)
-    if not char then return end
-    local root = char:FindFirstChild("HumanoidRootPart") :: BasePart?
-    local head = char:FindFirstChild("Head") :: BasePart?
-    local torso = (char:FindFirstChild("Torso") or char:FindFirstChild("UpperTorso")) :: BasePart?
-
-    local charKey = player.Name
-    local charAttr = char:GetAttribute("Character")
-    if charAttr and typeof(charAttr) == "string" then
-        charKey = charAttr
+        self.Data.Animations[animId] = record
+        self:SendNotification("anim_new", "📊 New Animation", "Discovered: " .. (track.Name or animId:sub(-12)), 2.5, "Info")
     end
 
-    if root and torso then
-        local isNew = not self.Data.HitboxProfiles[charKey]
-        self.Data.HitboxProfiles[charKey] = {
-            Character = charKey,
-            RootPartSize = { X = root.Size.X, Y = root.Size.Y, Z = root.Size.Z },
-            TorsoSize = { X = torso.Size.X, Y = torso.Size.Y, Z = torso.Size.Z },
-            HeadSize = head and { X = head.Size.X, Y = head.Size.Y, Z = head.Size.Z } or nil,
-            CanCollideRoot = root.CanCollide,
-            Updated = os.time(),
-        }
-        self._isDirty = true
+    record.PlayCount += 1
+    record.LastSeen = now
+    record.TotalPlaytime += (track.Length or 0)
+    setAdd(record.PlayersSeen, playerName)
+    setAdd(record.CharactersSeen, charType)
 
-        if isNew then
-            self:SendNotification("🎯 Yeni Hitbox Profili", string.format("Karakter: %s (%s)", charKey, player.Name), "Success")
-        end
+    -- Link to character profile
+    if self.Data.Characters[charType] then
+        setAdd(self.Data.Characters[charType].AnimationsSeen, animId)
     end
-end
 
-function TelemetryRecorder:RecordSound(sound: Sound, player: Player)
-    if not sound or not sound.SoundId then return end
-    local soundId = sound.SoundId:match("%d+") or sound.SoundId
-    if not soundId or #soundId == 0 then return end
-
-    if not self.Data.Sounds[soundId] then
-        self.Data.Sounds[soundId] = {
-            Id = soundId,
-            Name = sound.Name,
-            Volume = sound.Volume,
-            Pitch = sound.PlaybackSpeed,
-            Player = player.Name,
-            FirstSeen = os.time(),
-            Count = 1,
-        }
-        self._isDirty = true
-        self:SendNotification("🔊 Yeni Ses Kaydedildi", string.format("%s: %s (ID: %s)", player.Name, sound.Name, soundId), "Info")
-    else
-        self.Data.Sounds[soundId].Count += 1
-        self._isDirty = true
-    end
-end
-
-function TelemetryRecorder:ScanRemotes()
-    pcall(function()
-        local function CheckDescendant(inst: Instance)
-            if inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction") then
-                local path = inst:GetFullName()
-                if not self.Data.Remotes[path] then
-                    self.Data.Remotes[path] = {
-                        Name = inst.Name,
-                        Class = inst.ClassName,
-                        Path = path,
-                        Discovered = os.time(),
-                    }
-                    self._isDirty = true
-                end
-            end
-        end
-
-        for _, d in ipairs(ReplicatedStorage:GetDescendants()) do CheckDescendant(d) end
-        for _, d in ipairs(game:GetService("Workspace"):GetDescendants()) do
-            if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then CheckDescendant(d) end
-        end
-    end)
-end
-
-function TelemetryRecorder:RecordCombatEvent(eventType: string, details: any)
-    local evt = {
-        Type = eventType,
-        Timestamp = os.time(),
-        Details = details,
-    }
-    table.insert(self.Data.Events, evt)
-    if #self.Data.Events > 500 then
-        table.remove(self.Data.Events, 1)
-    end
     self._isDirty = true
 end
 
-function TelemetryRecorder:HookCharacter(player: Player, char: Model)
+-- ============================================================================
+-- CHARACTER PROFILE RECORDING
+-- ============================================================================
+function TelemetryRecorder:RecordCharacterProfile(char: any, player: Player)
     if not char then return end
-    local tracker = {
-        LastHealth = 100,
-        LastState = Enum.HumanoidStateType.Running,
-        RagdollStart = 0,
-        SkillTimestamps = {} :: { [string]: number },
-    }
-    self._playerTrackers[player] = tracker
+    local charType = getCharType(char)
+    local rigType = getRigType(char)
+    local now = os.time()
 
-    -- 1. Hitbox Profile Recording
-    self:RecordHitboxProfile(char, player)
-
-    -- 2. Attribute Change Hook (0ms instantaneous capture)
-    char.AttributeChanged:Connect(function(attrName)
+    local record = self.Data.Characters[charType]
+    if not record then
+        local attrList = {}
         pcall(function()
-            local val = char:GetAttribute(attrName)
-            self:RecordAttribute(attrName, val, player)
+            for attrName, _ in pairs(char:GetAttributes()) do
+                attrList[attrName] = true
+            end
+        end)
+        record = {
+            CharacterType  = charType,
+            RigType        = rigType,
+            PartCount      = 0,
+            Attributes     = attrList,
+            AnimationsSeen = {},
+            FirstSeen      = now,
+            LastSeen       = now,
+            ObservedCount  = 0,
+            PlayersSeen    = {},
+        }
+        self.Data.Characters[charType] = record
+        self:SendNotification("char_" .. charType, "🎭 New Character", "Profiled: " .. charType .. " (" .. rigType .. ")", 3.0, "Info")
+    end
 
-            -- Track Cooldowns if attribute is a skill hold
-            if attrName:find("Holding") or attrName:find("Skill") or attrName == "Blocking" then
-                local now = os.clock()
-                local last = tracker.SkillTimestamps[attrName]
-                if last then
-                    local interval = now - last
-                    if interval >= 0.5 and interval <= 60 then
-                        local charKey = tostring(char:GetAttribute("Character") or "Universal")
-                        if not self.Data.Cooldowns[charKey] then
-                            self.Data.Cooldowns[charKey] = {}
-                        end
-                        local cdData = self.Data.Cooldowns[charKey][attrName]
-                        local isNewCD = (cdData == nil)
-                        if not cdData then
-                            self.Data.Cooldowns[charKey][attrName] = {
-                                Min = interval,
-                                Max = interval,
-                                Avg = interval,
-                                Samples = { interval },
-                                Count = 1,
-                            }
-                        else
-                            cdData.Min = math.min(cdData.Min, interval)
-                            cdData.Max = math.max(cdData.Max, interval)
-                            cdData.Count += 1
-                            table.insert(cdData.Samples, interval)
-                            if #cdData.Samples > 20 then
-                                table.remove(cdData.Samples, 1)
-                            end
-                            local sum = 0
-                            for _, s in ipairs(cdData.Samples) do sum += s end
-                            cdData.Avg = sum / #cdData.Samples
-                        end
-                        self._isDirty = true
+    record.ObservedCount += 1
+    record.LastSeen = now
+    setAdd(record.PlayersSeen, player.Name)
 
-                        if isNewCD or cdData.Count % 5 == 0 then
-                            self:SendNotification("⏱️ Cooldown Ölçüldü", string.format("%s -> %s (%.1fs)", charKey, attrName, interval), "Warning")
-                        end
+    -- Update part count
+    local partCount = 0
+    pcall(function()
+        for _, desc in ipairs(char:GetDescendants()) do
+            if desc:IsA("BasePart") then partCount += 1 end
+        end
+    end)
+    record.PartCount = partCount
+
+    self._isDirty = true
+end
+
+-- ============================================================================
+-- HITBOX PROFILE RECORDING
+-- ============================================================================
+function TelemetryRecorder:RecordHitboxProfile(char: any, player: Player)
+    if not char then return end
+    local charType = getCharType(char)
+    local rigType = getRigType(char)
+    local now = os.time()
+
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+    local hrpPos = hrp.Position
+
+    local record = self.Data.Hitboxes[charType]
+    local shouldUpdate = not record or record.SampleCount == 0
+
+    if not record then
+        record = {
+            CharacterType = charType,
+            RigType       = rigType,
+            Parts         = {},
+            FirstSeen     = now,
+            LastSeen      = now,
+            SampleCount   = 0,
+        }
+        self.Data.Hitboxes[charType] = record
+    end
+
+    if shouldUpdate then
+        -- Record all BaseParts
+        pcall(function()
+            for _, part in ipairs(char:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    local rel = part.Position - hrpPos
+                    record.Parts[part.Name] = {
+                        Size             = { X = part.Size.X, Y = part.Size.Y, Z = part.Size.Z },
+                        RelativePosition = { X = math.floor(rel.X * 100) / 100, Y = math.floor(rel.Y * 100) / 100, Z = math.floor(rel.Z * 100) / 100 },
+                        CanCollide       = part.CanCollide,
+                        Mass             = part.Mass,
+                        Transparency     = part.Transparency,
+                        Class            = part.ClassName,
+                    }
+                end
+            end
+        end)
+        self:SendNotification("hitbox_" .. charType, "📐 Hitbox Mapped", charType .. " geometry captured (" .. countKeys(record.Parts) .. " parts)", 2.5, "Success")
+    end
+
+    record.SampleCount += 1
+    record.LastSeen = now
+    self._isDirty = true
+end
+
+-- ============================================================================
+-- ATTRIBUTE RECORDING + CORRELATION
+-- ============================================================================
+function TelemetryRecorder:RecordAttribute(attrName: string, value: any, player: Player, char: any)
+    if not attrName then return end
+    local charType = getCharType(char)
+    local now = os.time()
+
+    local record = self.Data.Attributes[attrName]
+    if not record then
+        record = {
+            Name           = attrName,
+            ValueType      = typeof(value),
+            ObservedValues = {},
+            FirstSeen      = now,
+            LastSeen       = now,
+            ChangeCount    = 0,
+            PlayersSeen    = {},
+            CharactersSeen = {},
+            IsBehavioral   = isBehavioral(attrName),
+        }
+        self.Data.Attributes[attrName] = record
+    end
+
+    record.ChangeCount += 1
+    record.LastSeen = now
+    setAdd(record.PlayersSeen, player.Name)
+    setAdd(record.CharactersSeen, charType)
+
+    -- Normalize observed values (handle different types)
+    local valKey = tostring(value)
+    if #valKey <= 32 then
+        record.ObservedValues[valKey] = true
+    end
+
+    -- Track cooldown: time since last change
+    if record.IsBehavioral then
+        self:TrackCooldown(charType, attrName)
+    end
+
+    -- Correlation: check animations playing within 500ms
+    self:CheckCorrelation(attrName, player)
+
+    self._isDirty = true
+end
+
+-- ============================================================================
+-- COOLDOWN ANALYSIS
+-- ============================================================================
+function TelemetryRecorder:TrackCooldown(charType: string, eventKey: string)
+    local now = os.clock()
+    local trackerKey = charType .. "_" .. eventKey
+    local lastTime = self._playerTrackers[trackerKey]
+
+    if lastTime then
+        local interval = now - lastTime
+        -- Only meaningful intervals (0.01s to 60s)
+        if interval >= 0.01 and interval <= 60 then
+            if not self.Data.Cooldowns[charType] then
+                self.Data.Cooldowns[charType] = {}
+            end
+            local cd = self.Data.Cooldowns[charType][eventKey]
+            if not cd then
+                cd = { Min = math.huge, Max = 0, Avg = 0, Samples = {}, Count = 0 }
+                self.Data.Cooldowns[charType][eventKey] = cd
+            end
+            cd.Count += 1
+            if interval < cd.Min then cd.Min = interval end
+            if interval > cd.Max then cd.Max = interval end
+            table.insert(cd.Samples, math.floor(interval * 1000))  -- store in ms
+            if #cd.Samples > 30 then table.remove(cd.Samples, 1) end
+            -- Rolling average from samples
+            local sum = 0
+            for _, s in ipairs(cd.Samples) do sum += s end
+            cd.Avg = math.floor(sum / #cd.Samples)
+        end
+    end
+    self._playerTrackers[trackerKey] = now
+end
+
+-- ============================================================================
+-- CORRELATION DETECTION
+-- ============================================================================
+function TelemetryRecorder:CheckCorrelation(attrName: string, player: Player)
+    if not self.Data.Attributes[attrName] or not self.Data.Attributes[attrName].IsBehavioral then return end
+
+    local char = player.Character
+    if not char then return end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
+    local anim = hum:FindFirstChildOfClass("Animator")
+    if not anim then return end
+
+    local now = os.time()
+    local tracks = {}
+    pcall(function() tracks = anim:GetPlayingAnimationTracks() end)
+
+    for _, track in ipairs(tracks) do
+        if not track.Animation then continue end
+        local animId = tostring(track.Animation.AnimationId or "")
+        if animId == "" or animId == "0" then continue end
+        local corrKey = animId .. "_" .. attrName
+        local corr = self.Data.Correlations[corrKey]
+        if not corr then
+            corr = {
+                AnimationId     = animId,
+                AttributeName   = attrName,
+                CoOccurrenceCount = 0,
+                WindowMs        = 500,
+                FirstSeen       = now,
+                LastSeen        = now,
+            }
+            self.Data.Correlations[corrKey] = corr
+        end
+        corr.CoOccurrenceCount += 1
+        corr.LastSeen = now
+    end
+end
+
+-- ============================================================================
+-- COMBAT EVENT RECORDING (ring buffer)
+-- ============================================================================
+function TelemetryRecorder:RecordCombatEvent(eventType: string, player: Player?, char: any?, details: any?)
+    local now = os.time()
+    local charType = char and getCharType(char) or "Unknown"
+    local playerName = player and player.Name or "Unknown"
+
+    -- Get current animation and position from player
+    local currentAnimation = nil
+    local position = nil
+    local velocity = nil
+    pcall(function()
+        if char then
+            local hrp = char:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                position = { X = math.floor(hrp.Position.X), Y = math.floor(hrp.Position.Y), Z = math.floor(hrp.Position.Z) }
+                velocity = math.floor(hrp.AssemblyLinearVelocity.Magnitude * 10) / 10
+            end
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            local anim = hum and hum:FindFirstChildOfClass("Animator")
+            if anim then
+                local tracks = anim:GetPlayingAnimationTracks()
+                if tracks and #tracks > 0 and tracks[1].Animation then
+                    currentAnimation = tostring(tracks[1].Animation.AnimationId)
+                end
+            end
+        end
+    end)
+
+    local event = {
+        Type             = eventType,
+        Timestamp        = now,
+        Player           = playerName,
+        Character        = charType,
+        Position         = position,
+        Velocity         = velocity,
+        CurrentAnimation = currentAnimation,
+        Details          = details or {},
+    }
+
+    table.insert(self.Data.CombatEvents, event)
+    -- Enforce ring buffer limit
+    local maxEv = self._maxCombatEvents
+    while #self.Data.CombatEvents > maxEv do
+        table.remove(self.Data.CombatEvents, 1)
+    end
+
+    self._isDirty = true
+end
+
+-- ============================================================================
+-- SOUND RECORDING
+-- ============================================================================
+function TelemetryRecorder:RecordSound(sound: any, player: Player, char: any)
+    if not sound or not sound:IsA("Sound") then return end
+    local soundId = tostring(sound.SoundId or "")
+    if soundId == "" or soundId == "0" then return end
+    local charType = getCharType(char)
+    local now = os.time()
+
+    local record = self.Data.Sounds[soundId]
+    if not record then
+        record = {
+            Id             = soundId,
+            Name           = sound.Name or "",
+            Volume         = sound.Volume or 0.5,
+            PlaybackSpeed  = sound.PlaybackSpeed or 1,
+            CharactersSeen = {},
+            PlayersSeen    = {},
+            PlayCount      = 0,
+            FirstSeen      = now,
+            LastSeen       = now,
+        }
+        self.Data.Sounds[soundId] = record
+    end
+
+    record.PlayCount += 1
+    record.LastSeen = now
+    setAdd(record.CharactersSeen, charType)
+    setAdd(record.PlayersSeen, player.Name)
+    self._isDirty = true
+end
+
+-- ============================================================================
+-- TOOL / ACCESSORY / ATTACHMENT RECORDING
+-- ============================================================================
+function TelemetryRecorder:RecordTool(inst: any, player: Player, char: any)
+    if not inst then return end
+    local name = inst.Name or "Unknown"
+    local class = inst.ClassName or "Unknown"
+    local charType = getCharType(char)
+    local now = os.time()
+    local key = class .. "_" .. name
+
+    local record = self.Data.Tools[key]
+    if not record then
+        record = {
+            Name           = name,
+            Class          = class,
+            CharactersSeen = {},
+            PlayersSeen    = {},
+            Count          = 0,
+            FirstSeen      = now,
+            LastSeen       = now,
+        }
+        self.Data.Tools[key] = record
+    end
+
+    record.Count += 1
+    record.LastSeen = now
+    setAdd(record.CharactersSeen, charType)
+    setAdd(record.PlayersSeen, player.Name)
+    self._isDirty = true
+end
+
+-- ============================================================================
+-- REMOTE DISCOVERY SCAN
+-- ============================================================================
+function TelemetryRecorder:ScanRemotes()
+    local now = os.time()
+    local scanTargets = { game:GetService("ReplicatedStorage"), game:GetService("Workspace") }
+
+    for _, root in ipairs(scanTargets) do
+        pcall(function()
+            for _, desc in ipairs(root:GetDescendants()) do
+                if desc:IsA("RemoteEvent") or desc:IsA("RemoteFunction") or desc:IsA("BindableEvent") then
+                    local path = getPath(desc)
+                    local record = self.Data.Remotes[path]
+                    if not record then
+                        record = {
+                            Name      = desc.Name,
+                            Class     = desc.ClassName,
+                            Path      = path,
+                            FirstSeen = now,
+                            LastSeen  = now,
+                        }
+                        self.Data.Remotes[path] = record
+                    else
+                        record.LastSeen = now
                     end
                 end
-                tracker.SkillTimestamps[attrName] = now
+            end
+        end)
+    end
+
+    self._isDirty = true
+end
+
+-- ============================================================================
+-- HOOK CHARACTER (called for each player's character)
+-- ============================================================================
+function TelemetryRecorder:HookCharacter(player: Player, char: any)
+    if not char then return end
+    -- Wait for character to fully load
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp then
+        pcall(function()
+            hrp = char:WaitForChild("HumanoidRootPart", 10)
+        end)
+        if not hrp then return end
+    end
+
+    local charType = getCharType(char)
+
+    -- Record static profiles
+    self:RecordCharacterProfile(char, player)
+    self:RecordHitboxProfile(char, player)
+
+    -- Hook AttributeChanged
+    local attrConn = char.AttributeChanged:Connect(function(attrName: string)
+        if not self._isRecording then return end
+        pcall(function()
+            local val = char:GetAttribute(attrName)
+            self:RecordAttribute(attrName, val, player, char)
+        end)
+    end)
+    local connKey = "AttrChanged_" .. player.UserId
+    if self._connections[connKey] then
+        pcall(function() self._connections[connKey]:Disconnect() end)
+    end
+    self._connections[connKey] = attrConn
+
+    -- Do initial attribute scan
+    pcall(function()
+        for attrName, val in pairs(char:GetAttributes()) do
+            self:RecordAttribute(attrName, val, player, char)
+        end
+    end)
+
+    -- Hook HealthChanged
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if hum then
+        local healthConn = hum.HealthChanged:Connect(function(newHp: number)
+            if not self._isRecording then return end
+            self:RecordCombatEvent("HealthChange", player, char, { HP = math.floor(newHp) })
+        end)
+        local hKey = "Health_" .. player.UserId
+        if self._connections[hKey] then pcall(function() self._connections[hKey]:Disconnect() end) end
+        self._connections[hKey] = healthConn
+
+        -- Hook StateChanged for ragdoll events
+        local stateConn = hum.StateChanged:Connect(function(_, newState: Enum.HumanoidStateType)
+            if not self._isRecording then return end
+            if newState == Enum.HumanoidStateType.Physics or newState == Enum.HumanoidStateType.FallingDown then
+                self:RecordCombatEvent("RagdollEntered", player, char, { State = tostring(newState) })
+            elseif newState == Enum.HumanoidStateType.Running or newState == Enum.HumanoidStateType.Landed then
+                self:RecordCombatEvent("RagdollWakeup", player, char, { State = tostring(newState) })
+            end
+        end)
+        local sKey = "State_" .. player.UserId
+        if self._connections[sKey] then pcall(function() self._connections[sKey]:Disconnect() end) end
+        self._connections[sKey] = stateConn
+    end
+
+    -- Hook Animator for animation events
+    local anim = hum and hum:FindFirstChildOfClass("Animator")
+    if anim then
+        local animConn = anim.AnimationPlayed:Connect(function(track: AnimationTrack)
+            if not self._isRecording then return end
+            pcall(function() self:RecordAnimation(track, player, char) end)
+        end)
+        local aKey = "Anim_" .. player.UserId
+        if self._connections[aKey] then pcall(function() self._connections[aKey]:Disconnect() end) end
+        self._connections[aKey] = animConn
+    end
+
+    -- Hook DescendantAdded for sounds and tools
+    local descConn = char.DescendantAdded:Connect(function(desc: Instance)
+        if not self._isRecording then return end
+        pcall(function()
+            if desc:IsA("Sound") then
+                self:RecordSound(desc, player, char)
+            elseif desc:IsA("Tool") or desc:IsA("Accessory") then
+                self:RecordTool(desc, player, char)
             end
         end)
     end)
+    local dKey = "Desc_" .. player.UserId
+    if self._connections[dKey] then pcall(function() self._connections[dKey]:Disconnect() end) end
+    self._connections[dKey] = descConn
 
-    -- 3. Humanoid Events Hook (Damage & Ragdoll Duration Tracking)
-    local hum = char:WaitForChild("Humanoid", 4) :: Humanoid?
-    if hum then
-        tracker.LastHealth = hum.Health
-        hum.HealthChanged:Connect(function(newHealth)
-            local diff = tracker.LastHealth - newHealth
-            tracker.LastHealth = newHealth
-            if diff > 1 then
-                self:RecordCombatEvent("DamageDealt", {
-                    Victim = player.Name,
-                    Damage = diff,
-                    RemainingHP = newHealth,
-                })
+    -- Scan existing descendants
+    pcall(function()
+        for _, desc in ipairs(char:GetDescendants()) do
+            if desc:IsA("Sound") then
+                self:RecordSound(desc, player, char)
+            elseif desc:IsA("Tool") or desc:IsA("Accessory") then
+                self:RecordTool(desc, player, char)
             end
-        end)
-
-        hum.StateChanged:Connect(function(oldState, newState)
-            if newState == Enum.HumanoidStateType.Physics or newState == Enum.HumanoidStateType.Ragdoll then
-                tracker.RagdollStart = os.clock()
-                self:RecordCombatEvent("RagdollEntered", {
-                    Player = player.Name,
-                    State = tostring(newState),
-                })
-            elseif oldState == Enum.HumanoidStateType.Physics or oldState == Enum.HumanoidStateType.Ragdoll then
-                if tracker.RagdollStart > 0 then
-                    local ragDuration = os.clock() - tracker.RagdollStart
-                    tracker.RagdollStart = 0
-                    self:RecordCombatEvent("RagdollWakeup", {
-                        Player = player.Name,
-                        Duration = ragDuration,
-                    })
-                end
-            end
-        end)
-
-        -- 4. Animator Track Playing Hook
-        local animator = hum:WaitForChild("Animator", 4) :: Animator?
-        if animator then
-            animator.AnimationPlayed:Connect(function(track)
-                self:RecordAnimation(track, player)
-            end)
-
-            pcall(function()
-                for _, tr in ipairs(animator:GetPlayingAnimationTracks()) do
-                    self:RecordAnimation(tr, player)
-                end
-            end)
-        end
-    end
-
-    -- 5. Sounds & Tools Hook
-    char.DescendantAdded:Connect(function(desc)
-        if desc:IsA("Sound") then
-            desc.Played:Connect(function()
-                self:RecordSound(desc, player)
-            end)
-        elseif desc:IsA("Tool") or desc:IsA("Model") then
-            self:RecordAttribute("ToolEquipped_" .. desc.Name, desc.ClassName, player)
         end
     end)
 end
 
+-- ============================================================================
+-- INIT HOOKS (called once at startup)
+-- ============================================================================
 function TelemetryRecorder:InitHooks()
     -- Hook existing players
     for _, p in ipairs(Players:GetPlayers()) do
         if p.Character then
-            task.spawn(function()
-                self:HookCharacter(p, p.Character)
-            end)
+            task.spawn(function() self:HookCharacter(p, p.Character) end)
         end
         local charAddedKey = "CharAdded_" .. tostring(p.UserId)
-        self._connections[charAddedKey] = p.CharacterAdded:Connect(function(c)
-            task.spawn(function()
-                self:HookCharacter(p, c)
-            end)
+        self._connections[charAddedKey] = p.CharacterAdded:Connect(function(char)
+            task.spawn(function() self:HookCharacter(p, char) end)
         end)
     end
 
     -- Hook newly joined players
     self._connections["PlayerAdded"] = Players.PlayerAdded:Connect(function(p)
         local charAddedKey = "CharAdded_" .. tostring(p.UserId)
-        self._connections[charAddedKey] = p.CharacterAdded:Connect(function(c)
-            task.spawn(function()
-                self:HookCharacter(p, c)
-            end)
+        self._connections[charAddedKey] = p.CharacterAdded:Connect(function(char)
+            task.spawn(function() self:HookCharacter(p, char) end)
         end)
     end)
 
     self._connections["PlayerRemoving"] = Players.PlayerRemoving:Connect(function(p)
-        self._playerTrackers[p] = nil
-        -- Clean up per-player CharacterAdded connection
+        self._playerTrackers["target_" .. p.Name] = nil
         local charAddedKey = "CharAdded_" .. tostring(p.UserId)
         if self._connections[charAddedKey] then
             pcall(function() self._connections[charAddedKey]:Disconnect() end)
             self._connections[charAddedKey] = nil
         end
     end)
+
+    -- Initial remote scan
+    task.spawn(function() self:ScanRemotes() end)
 end
 
-function TelemetryRecorder:Update(dt: number, config: any)
-    if not config.Telemetry or not config.Telemetry.AutoRecordData then return end
+-- ============================================================================
+-- LOAD FROM DISK (multi-file first, single file fallback)
+-- ============================================================================
+function TelemetryRecorder:LoadFromDisk()
+    -- Try multi-file first
+    local metaRaw = safeReadFile("tsb_data/metadata.json")
+    if metaRaw then
+        local categories = {
+            "metadata", "animations", "characters", "hitboxes",
+            "attributes", "combat_events", "cooldowns", "sounds", "tools", "remotes"
+        }
+        local dataMap = {
+            metadata      = "Meta",
+            animations    = "Animations",
+            characters    = "Characters",
+            hitboxes      = "Hitboxes",
+            attributes    = "Attributes",
+            combat_events = "CombatEvents",
+            cooldowns     = "Cooldowns",
+            sounds        = "Sounds",
+            tools         = "Tools",
+            remotes       = "Remotes",
+        }
+        local loaded = false
+        for _, cat in ipairs(categories) do
+            local raw = safeReadFile("tsb_data/" .. cat .. ".json")
+            if raw then
+                local decoded = JSONDecode(raw)
+                if decoded and type(decoded) == "table" then
+                    local key = dataMap[cat]
+                    if key then
+                        if cat == "metadata" then
+                            -- Merge meta: preserve session count
+                            if type(decoded.TotalSessions) == "number" then
+                                self.Data.Meta.TotalSessions = decoded.TotalSessions + 1
+                            end
+                            if type(decoded.Created) == "number" then
+                                self.Data.Meta.Created = decoded.Created
+                            end
+                        elseif cat == "combat_events" then
+                            if type(decoded) == "table" then
+                                for _, ev in ipairs(decoded) do
+                                    table.insert(self.Data.CombatEvents, ev)
+                                end
+                                -- Trim to max
+                                while #self.Data.CombatEvents > self._maxCombatEvents do
+                                    table.remove(self.Data.CombatEvents, 1)
+                                end
+                            end
+                        else
+                            -- Merge into existing data table
+                            for k, v in pairs(decoded) do
+                                if self.Data[key] then
+                                    self.Data[key][k] = v
+                                end
+                            end
+                        end
+                        loaded = true
+                    end
+                end
+            end
+        end
+        if loaded then
+            self._logger:Info("TelemetryRecorder", "Loaded multi-file dataset from tsb_data/")
+            return
+        end
+    end
 
-    -- Periodic scan of playing animations across all active players
-    for _, p in ipairs(Players:GetPlayers()) do
-        local char = p.Character
-        if char then
+    -- Fallback: single combined file
+    local raw = safeReadFile("tsb_combat_data.json")
+    if not raw then return end
+    local decoded = JSONDecode(raw)
+    if not decoded or type(decoded) ~= "table" then return end
+
+    -- Merge each category
+    for key, tbl in pairs(decoded) do
+        if self.Data[key] and type(tbl) == "table" then
+            if key == "Meta" then
+                if type(tbl.TotalSessions) == "number" then
+                    self.Data.Meta.TotalSessions = tbl.TotalSessions + 1
+                end
+            elseif key == "CombatEvents" then
+                for _, ev in ipairs(tbl) do
+                    table.insert(self.Data.CombatEvents, ev)
+                end
+            else
+                for k, v in pairs(tbl) do
+                    self.Data[key][k] = v
+                end
+            end
+        end
+    end
+
+    self._logger:Info("TelemetryRecorder", "Loaded single-file dataset from tsb_combat_data.json")
+end
+
+-- ============================================================================
+-- SAVE TO DISK (multi-file + combined fallback)
+-- ============================================================================
+function TelemetryRecorder:SaveToDisk(force: boolean?)
+    if not force and not self._isDirty then return end
+    self.Data.Meta.LastUpdated = os.time()
+
+    -- Try multi-file save
+    local multiOk = false
+    pcall(function()
+        if writefile and makefolder then
+            safeMakeFolder("tsb_data")
+            safeWriteFile("tsb_data/metadata.json", JSONEncode(self.Data.Meta))
+            safeWriteFile("tsb_data/animations.json", JSONEncode(self.Data.Animations))
+            safeWriteFile("tsb_data/characters.json", JSONEncode(self.Data.Characters))
+            safeWriteFile("tsb_data/hitboxes.json", JSONEncode(self.Data.Hitboxes))
+            safeWriteFile("tsb_data/attributes.json", JSONEncode(self.Data.Attributes))
+            safeWriteFile("tsb_data/combat_events.json", JSONEncode(self.Data.CombatEvents))
+            safeWriteFile("tsb_data/cooldowns.json", JSONEncode(self.Data.Cooldowns))
+            safeWriteFile("tsb_data/sounds.json", JSONEncode(self.Data.Sounds))
+            safeWriteFile("tsb_data/tools.json", JSONEncode(self.Data.Tools))
+            safeWriteFile("tsb_data/remotes.json", JSONEncode(self.Data.Remotes))
+            multiOk = true
+        end
+    end)
+
+    -- Always also save combined file for backward compat
+    safeWriteFile("tsb_combat_data.json", JSONEncode(self.Data))
+
+    self._isDirty = false
+    self._lastSaveTick = os.clock()
+    self._logger:Debug("TelemetryRecorder", string.format("Saved dataset (multi=%s) — Anims:%d Chars:%d Attrs:%d Events:%d",
+        tostring(multiOk),
+        countKeys(self.Data.Animations),
+        countKeys(self.Data.Characters),
+        countKeys(self.Data.Attributes),
+        #self.Data.CombatEvents
+    ))
+end
+
+-- ============================================================================
+-- UPDATE (called from scheduler)
+-- ============================================================================
+function TelemetryRecorder:Update(dt: number, config: any)
+    local cfg = config and config.Telemetry
+    if not cfg then return end
+
+    self._isRecording = cfg.AutoRecordData ~= false
+    self._maxCombatEvents = cfg.MaxCombatEvents or 1000
+
+    -- Periodic remote scan (every 30s)
+    local now = os.clock()
+    if cfg.RecordRemotes ~= false and (now - self._lastRemoteScan) >= 30 then
+        self._lastRemoteScan = now
+        task.spawn(function() self:ScanRemotes() end)
+    end
+
+    -- Periodic animation scan for players (catch missed AnimationPlayed events)
+    if self._isRecording and cfg.RecordAnimations ~= false then
+        for _, p in ipairs(Players:GetPlayers()) do
+            local char = p.Character
+            if not char then continue end
             local hum = char:FindFirstChildOfClass("Humanoid")
-            local animator = hum and hum:FindFirstChildOfClass("Animator")
-            if animator then
+            local anim = hum and hum:FindFirstChildOfClass("Animator")
+            if anim then
                 pcall(function()
-                    for _, tr in ipairs(animator:GetPlayingAnimationTracks()) do
-                        self:RecordAnimation(tr, p)
+                    for _, track in ipairs(anim:GetPlayingAnimationTracks()) do
+                        if track.IsPlaying and track.Animation then
+                            local animId = tostring(track.Animation.AnimationId or "")
+                            if animId ~= "" and animId ~= "0" and not self.Data.Animations[animId] then
+                                self:RecordAnimation(track, p, char)
+                            end
+                        end
                     end
                 end)
             end
         end
     end
 
-    -- Periodic Autosave Check
-    local interval = (config.Telemetry and config.Telemetry.AutoSaveInterval) or 15
-    if (os.clock() - self._lastSaveTick) >= interval then
+    -- Autosave
+    local interval = cfg.AutoSaveInterval or 15
+    if (now - self._lastSaveTick) >= interval then
         self:SaveToDisk(false)
     end
 end
 
-function TelemetryRecorder:GetStats(): TelemetryStats
+-- ============================================================================
+-- STATS / EXPORT
+-- ============================================================================
+function TelemetryRecorder:GetStats(): any
     return {
-        TotalAnimations = self:CountKeys(self.Data.Animations),
-        TotalAttributes = self:CountKeys(self.Data.Attributes),
-        TotalEvents = #self.Data.Events,
-        TotalHitboxProfiles = self:CountKeys(self.Data.HitboxProfiles),
-        TotalCooldownProfiles = self:CountKeys(self.Data.Cooldowns),
-        TotalSounds = self:CountKeys(self.Data.Sounds),
-        TotalRemotes = self:CountKeys(self.Data.Remotes),
-        LastSaved = self._lastSaveTick,
-        IsRecording = true,
+        TotalAnimations       = countKeys(self.Data.Animations),
+        TotalCharacters       = countKeys(self.Data.Characters),
+        TotalHitboxProfiles   = countKeys(self.Data.Hitboxes),
+        TotalAttributes       = countKeys(self.Data.Attributes),
+        TotalCorrelations     = countKeys(self.Data.Correlations),
+        TotalCombatEvents     = #self.Data.CombatEvents,
+        TotalCooldownProfiles = countKeys(self.Data.Cooldowns),
+        TotalSounds           = countKeys(self.Data.Sounds),
+        TotalTools            = countKeys(self.Data.Tools),
+        TotalRemotes          = countKeys(self.Data.Remotes),
+        LastSaved             = self._lastSaveTick,
+        IsRecording           = self._isRecording,
+        SessionDuration       = os.clock() - self._sessionStart,
+        SessionNumber         = self.Data.Meta.TotalSessions,
     }
 end
 
+function TelemetryRecorder:ExportSummary(): string
+    local s = self:GetStats()
+    return string.format(
+        "=== TSB Data Collector v10.0 ===\nSession #%d | Runtime: %.0fs\nAnimations: %d | Characters: %d | Hitboxes: %d\nAttributes: %d | Correlations: %d | Events: %d\nCooldowns: %d | Sounds: %d | Tools: %d | Remotes: %d",
+        s.SessionNumber, s.SessionDuration,
+        s.TotalAnimations, s.TotalCharacters, s.TotalHitboxProfiles,
+        s.TotalAttributes, s.TotalCorrelations, s.TotalCombatEvents,
+        s.TotalCooldownProfiles, s.TotalSounds, s.TotalTools, s.TotalRemotes
+    )
+end
+
+-- ============================================================================
+-- DESTROY
+-- ============================================================================
 function TelemetryRecorder:Destroy()
+    self._isRecording = false
     self:SaveToDisk(true)
-    for _, conn in pairs(self._connections) do
-        pcall(function() conn:Disconnect() end)
+    for key, conn in pairs(self._connections) do
+        if conn and typeof(conn) == "RBXScriptConnection" then
+            pcall(function() conn:Disconnect() end)
+        end
+        self._connections[key] = nil
     end
-    self._connections = {}
-    self._playerTrackers = {}
+    table.clear(self._playerTrackers)
+    table.clear(self._notifThrottle)
 end
 
 return TelemetryRecorder
@@ -4472,11 +5096,15 @@ function World.new(deps: { ConfigManager: any, Logger: any })
         },
         LastHopCheck = 0,
         HopActive = false,
+        _lastFullBright = nil :: boolean?,
+        _lastRemoveFog = nil :: boolean?,
     }, World)
     return self
 end
 
 function World:ToggleFullBright(enable: boolean)
+    if self._lastFullBright == enable then return end
+    self._lastFullBright = enable
     if enable then
         Lighting.Ambient = Color3.new(1, 1, 1)
         Lighting.OutdoorAmbient = Color3.new(1, 1, 1)
@@ -4489,6 +5117,8 @@ function World:ToggleFullBright(enable: boolean)
 end
 
 function World:ToggleRemoveFog(enable: boolean)
+    if self._lastRemoveFog == enable then return end
+    self._lastRemoveFog = enable
     if enable then
         Lighting.FogEnd = 9e9
     else
@@ -4896,9 +5526,45 @@ function Components.Dropdown(parent: Instance, title: string, options: { string 
     local isOpen = false
     local currentSelected = defaultSelected
 
+    local function RebuildOptions(opts: { string })
+        for _, child in ipairs(listFrame:GetChildren()) do
+            if child:IsA("TextButton") then
+                child:Destroy()
+            end
+        end
+        listFrame.Size = UDim2.new(1, -24, 0, #opts * 26)
+
+        for idx, opt in ipairs(opts) do
+            local optBtn = Instance.new("TextButton")
+            optBtn.Size = UDim2.new(1, 0, 0, 26)
+            optBtn.BackgroundColor3 = Theme.Colors.Header
+            optBtn.BorderSizePixel = 0
+            optBtn.Text = "  " .. opt
+            optBtn.TextColor3 = (opt == currentSelected) and accent.Primary or Theme.Colors.TextSecondary
+            optBtn.TextSize = 11
+            optBtn.Font = Theme.Fonts.Body
+            optBtn.TextXAlignment = Enum.TextXAlignment.Left
+            optBtn.LayoutOrder = idx
+            optBtn.Parent = listFrame
+            Instance.new("UICorner", optBtn).CornerRadius = UDim.new(0, 4)
+
+            optBtn.MouseEnter:Connect(function()
+                Theme.Tween(optBtn, 0.1, { BackgroundColor3 = Theme.Colors.CardHover, TextColor3 = Theme.Colors.TextPrimary })
+            end)
+            optBtn.MouseLeave:Connect(function()
+                local isSel = (opt == currentSelected)
+                Theme.Tween(optBtn, 0.1, { BackgroundColor3 = Theme.Colors.Header, TextColor3 = isSel and accent.Primary or Theme.Colors.TextSecondary })
+            end)
+            optBtn.MouseButton1Click:Connect(function()
+                SelectOption(opt)
+            end)
+        end
+    end
+
+    local currentOpts = options
     local function ToggleOpen()
         isOpen = not isOpen
-        local targetH = isOpen and (48 + #options * 28) or 42
+        local targetH = isOpen and (48 + #currentOpts * 28) or 42
         arrow.Text = isOpen and "▲" or "▼"
         Theme.Tween(frame, 0.18, { Size = UDim2.new(1, 0, 0, targetH) })
     end
@@ -4912,37 +5578,22 @@ function Components.Dropdown(parent: Instance, title: string, options: { string 
         end
     end
 
-    for idx, opt in ipairs(options) do
-        local optBtn = Instance.new("TextButton")
-        optBtn.Size = UDim2.new(1, 0, 0, 26)
-        optBtn.BackgroundColor3 = Theme.Colors.Header
-        optBtn.BorderSizePixel = 0
-        optBtn.Text = "  " .. opt
-        optBtn.TextColor3 = (opt == currentSelected) and accent.Primary or Theme.Colors.TextSecondary
-        optBtn.TextSize = 11
-        optBtn.Font = Theme.Fonts.Body
-        optBtn.TextXAlignment = Enum.TextXAlignment.Left
-        optBtn.LayoutOrder = idx
-        optBtn.Parent = listFrame
-        Instance.new("UICorner", optBtn).CornerRadius = UDim.new(0, 4)
-
-        optBtn.MouseEnter:Connect(function()
-            Theme.Tween(optBtn, 0.1, { BackgroundColor3 = Theme.Colors.CardHover, TextColor3 = Theme.Colors.TextPrimary })
-        end)
-        optBtn.MouseLeave:Connect(function()
-            local isSel = (opt == currentSelected)
-            Theme.Tween(optBtn, 0.1, { BackgroundColor3 = Theme.Colors.Header, TextColor3 = isSel and accent.Primary or Theme.Colors.TextSecondary })
-        end)
-        optBtn.MouseButton1Click:Connect(function()
-            SelectOption(opt)
-        end)
+    local function SetOptions(newOpts: { string })
+        currentOpts = newOpts
+        RebuildOptions(newOpts)
+        if isOpen then
+            local targetH = 48 + #newOpts * 28
+            Theme.Tween(frame, 0.18, { Size = UDim2.new(1, 0, 0, targetH) })
+        end
     end
 
+    RebuildOptions(options)
     selectBtn.MouseButton1Click:Connect(ToggleOpen)
 
     return {
         Frame = frame,
         Select = SelectOption,
+        SetOptions = SetOptions,
         GetSelected = function() return currentSelected end,
     }
 end
@@ -5668,13 +6319,19 @@ function DiagnosticsTab.Build(parent: Instance, ctx: any)
     end
 
     -- TSB Live Telemetry & Game Data Auto-Recorder
-    Components.Section(parent, "TSB Game Data & Combat Telemetry Auto-Recorder", accent)
-    local teleStats = diag.Telemetry or { TotalAnimations = 0, TotalAttributes = 0, TotalEvents = 0, TotalHitboxProfiles = 0, TotalCooldownProfiles = 0 }
+    Components.Section(parent, "TSB Game Data & Comprehensive Combat Telemetry", accent)
+    local teleStats = diag.Telemetry or {}
     
-    local animBadge = Components.StatusBadge(parent, "Animations Logged (All Players)", tostring(teleStats.TotalAnimations or 0), Theme.Colors.Success)
-    local attrBadge = Components.StatusBadge(parent, "Attributes Tracked (0ms States)", tostring(teleStats.TotalAttributes or 0), Theme.Colors.Info)
-    local eventBadge = Components.StatusBadge(parent, "Combat & Ragdoll Events", tostring(teleStats.TotalEvents or 0), Theme.Colors.Warning)
+    local animBadge = Components.StatusBadge(parent, "Animations Logged", tostring(teleStats.TotalAnimations or 0), Theme.Colors.Success)
+    local charBadge = Components.StatusBadge(parent, "Character Profiles", tostring(teleStats.TotalCharacters or 0), Theme.Colors.Info)
+    local hitboxBadge = Components.StatusBadge(parent, "Hitbox Profiles (Rig/Parts)", tostring(teleStats.TotalHitboxProfiles or 0), Theme.Colors.Success)
+    local attrBadge = Components.StatusBadge(parent, "Attributes Tracked", tostring(teleStats.TotalAttributes or 0), Theme.Colors.Info)
+    local corrBadge = Components.StatusBadge(parent, "Correlations Discovered", tostring(teleStats.TotalCorrelations or 0), Theme.Colors.Success)
+    local eventBadge = Components.StatusBadge(parent, "Combat & Ragdoll Events", tostring(teleStats.TotalCombatEvents or teleStats.TotalEvents or 0), Theme.Colors.Warning)
     local cdBadge = Components.StatusBadge(parent, "Skill Cooldown Profiles", tostring(teleStats.TotalCooldownProfiles or 0), Theme.Colors.TextPrimary)
+    local soundBadge = Components.StatusBadge(parent, "Sounds Cataloged", tostring(teleStats.TotalSounds or 0), Theme.Colors.TextPrimary)
+    local toolBadge = Components.StatusBadge(parent, "Tools & Accessories", tostring(teleStats.TotalTools or 0), Theme.Colors.TextSecondary)
+    local remoteBadge = Components.StatusBadge(parent, "Remotes & Objects Found", tostring(teleStats.TotalRemotes or 0), Theme.Colors.Info)
 
     local cfg_diag = ctx.ConfigManager.Config
     Components.Toggle(parent, "Auto-Record All Player Data", "Enable continuous live telemetry capture from all players", cfg_diag.Telemetry and cfg_diag.Telemetry.AutoRecordData or false, accent, function(val)
@@ -5682,18 +6339,39 @@ function DiagnosticsTab.Build(parent: Instance, ctx: any)
         notifs:Show("Telemetry", val and "Live combat data recording ACTIVE." or "Data recording paused.", 2.0, val and "Success" or "Warning")
     end)
 
-    Components.Button(parent, "Force Save Data to Disk (tsb_combat_data.json)", "Save Telemetry Now", "Primary", accent, function()
+    Components.Button(parent, "Force Save Data to Disk (tsb_data/ & tsb_combat_data.json)", "Save Telemetry Now", "Primary", accent, function()
         if bootstrap and bootstrap.Container and bootstrap.Container:Has("TelemetryRecorder") then
             local recorder = bootstrap.Container:Get("TelemetryRecorder")
             recorder:SaveToDisk(true)
             local st = recorder:GetStats()
             animBadge.Update(tostring(st.TotalAnimations), Theme.Colors.Success)
+            charBadge.Update(tostring(st.TotalCharacters), Theme.Colors.Info)
+            hitboxBadge.Update(tostring(st.TotalHitboxProfiles), Theme.Colors.Success)
             attrBadge.Update(tostring(st.TotalAttributes), Theme.Colors.Info)
-            eventBadge.Update(tostring(st.TotalEvents), Theme.Colors.Warning)
+            corrBadge.Update(tostring(st.TotalCorrelations), Theme.Colors.Success)
+            eventBadge.Update(tostring(st.TotalCombatEvents), Theme.Colors.Warning)
             cdBadge.Update(tostring(st.TotalCooldownProfiles), Theme.Colors.TextPrimary)
-            notifs:Show("Telemetry", string.format("Saved %d anims & %d attrs to tsb_combat_data.json!", st.TotalAnimations, st.TotalAttributes), 3.0, "Success")
+            soundBadge.Update(tostring(st.TotalSounds), Theme.Colors.TextPrimary)
+            toolBadge.Update(tostring(st.TotalTools), Theme.Colors.TextSecondary)
+            remoteBadge.Update(tostring(st.TotalRemotes), Theme.Colors.Info)
+            notifs:Show("Telemetry", string.format("Saved dataset (%d anims, %d chars, %d hitboxes) to disk!", st.TotalAnimations, st.TotalCharacters, st.TotalHitboxProfiles), 3.0, "Success")
         else
             notifs:Show("Telemetry", "TelemetryRecorder service not ready.", 2.5, "Error")
+        end
+    end)
+
+    Components.Button(parent, "Export Telemetry Summary", "Export Summary", "Secondary", accent, function()
+        if bootstrap and bootstrap.Container and bootstrap.Container:Has("TelemetryRecorder") then
+            local recorder = bootstrap.Container:Get("TelemetryRecorder")
+            local summary = recorder:ExportSummary()
+            pcall(function()
+                if typeof(setclipboard) == "function" then
+                    setclipboard(summary)
+                    notifs:Show("Telemetry Export", "Summary copied to clipboard!\n" .. summary, 4.0, "Success")
+                    return
+                end
+            end)
+            notifs:Show("Telemetry Export", summary, 4.0, "Info")
         end
     end)
 
@@ -5744,9 +6422,15 @@ function DiagnosticsTab.Build(parent: Instance, ctx: any)
 
             local freshTele = fresh.Telemetry or {}
             animBadge.Update(tostring(freshTele.TotalAnimations or 0), Theme.Colors.Success)
+            charBadge.Update(tostring(freshTele.TotalCharacters or 0), Theme.Colors.Info)
+            hitboxBadge.Update(tostring(freshTele.TotalHitboxProfiles or 0), Theme.Colors.Success)
             attrBadge.Update(tostring(freshTele.TotalAttributes or 0), Theme.Colors.Info)
-            eventBadge.Update(tostring(freshTele.TotalEvents or 0), Theme.Colors.Warning)
+            corrBadge.Update(tostring(freshTele.TotalCorrelations or 0), Theme.Colors.Success)
+            eventBadge.Update(tostring(freshTele.TotalCombatEvents or freshTele.TotalEvents or 0), Theme.Colors.Warning)
             cdBadge.Update(tostring(freshTele.TotalCooldownProfiles or 0), Theme.Colors.TextPrimary)
+            soundBadge.Update(tostring(freshTele.TotalSounds or 0), Theme.Colors.TextPrimary)
+            toolBadge.Update(tostring(freshTele.TotalTools or 0), Theme.Colors.TextSecondary)
+            remoteBadge.Update(tostring(freshTele.TotalRemotes or 0), Theme.Colors.Info)
 
             for fName, b in pairs(featureBadges) do
                 local fs = fresh.FeatureStates[fName]
@@ -6713,6 +7397,22 @@ function UIController:Init()
                 if cfg.Movement then cfg.Movement.Fly = false; cfg.Movement.Noclip = false end
                 if cfg.Combat then cfg.Combat.Aimlock = false; cfg.Combat.AutoM1 = false end
                 self:ShowNotification("🛑 Emergency Stop", "All active combat & movement loops stopped.", 2.5, "Warning")
+            elseif input.KeyCode == (kb.MassBringKey or Enum.KeyCode.G) then
+                if self._deps.Container and self._deps.Container:Has("Combat") then
+                    local combat = self._deps.Container:Get("Combat")
+                    if combat.MassBringActive then
+                        combat:StopMassBring()
+                        self:ShowNotification("Mass Bring", "Mass Bring STOPPED", 2.0, "Warning")
+                    else
+                        combat:StartMassBring(cfg)
+                        self:ShowNotification("Mass Bring", "Mass Bring STARTED", 2.0, "Success")
+                    end
+                end
+            elseif input.KeyCode == (kb.ToggleSkyDodge or Enum.KeyCode.H) then
+                if cfg.Survival then
+                    cfg.Survival.SkyDodge = not cfg.Survival.SkyDodge
+                    self:ShowNotification("Sky Dodge", cfg.Survival.SkyDodge and "Sky Dodge ENABLED" or "Sky Dodge DISABLED", 2.0, cfg.Survival.SkyDodge and "Success" or "Warning")
+                end
             end
         end
     end)

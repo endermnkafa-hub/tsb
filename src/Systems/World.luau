@@ -19,11 +19,15 @@ function World.new(deps: { ConfigManager: any, Logger: any })
         },
         LastHopCheck = 0,
         HopActive = false,
+        _lastFullBright = nil :: boolean?,
+        _lastRemoveFog = nil :: boolean?,
     }, World)
     return self
 end
 
 function World:ToggleFullBright(enable: boolean)
+    if self._lastFullBright == enable then return end
+    self._lastFullBright = enable
     if enable then
         Lighting.Ambient = Color3.new(1, 1, 1)
         Lighting.OutdoorAmbient = Color3.new(1, 1, 1)
@@ -36,6 +40,8 @@ function World:ToggleFullBright(enable: boolean)
 end
 
 function World:ToggleRemoveFog(enable: boolean)
+    if self._lastRemoveFog == enable then return end
+    self._lastRemoveFog = enable
     if enable then
         Lighting.FogEnd = 9e9
     else

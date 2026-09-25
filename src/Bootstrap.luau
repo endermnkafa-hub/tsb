@@ -278,6 +278,8 @@ function Bootstrap:Init()
             combat:UpdateAutoM1(configManager.Config)
             combat:UpdateAutoBlock(configManager.Config)
             combat:UpdateHitboxExpander(configManager.Config)
+            combat:UpdateAutoEvasive(configManager.Config)
+            combat:UpdateMassBring(configManager.Config)
             movement:UpdateBehindLock(dt, configManager.Config, combat)
         end
     })
@@ -287,11 +289,12 @@ function Bootstrap:Init()
         Phase = "Heartbeat",
         Priority = 90,
         Budget = 1.0,
-        Dependencies = { "Movement" },
+        Dependencies = { "Movement", "Combat" },
         Enabled = true,
         Update = function(self, dt, ctx)
             movement:UpdateSpeed(dt, configManager.Config)
             movement:UpdateAntiVoid(configManager.Config)
+            combat:UpdateAntiRagdoll(configManager.Config)
         end
     })
 
@@ -304,6 +307,7 @@ function Bootstrap:Init()
         Enabled = true,
         Update = function(self, dt, ctx)
             skills:UpdateAutoSkillSpam(configManager.Config)
+            skills:UpdateVoidKill(configManager.Config)
         end
     })
 

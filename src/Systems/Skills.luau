@@ -63,4 +63,36 @@ function Skills:UpdateAutoSkillSpam(config: any)
     end
 end
 
+function Skills:UpdateVoidKill(config: any)
+    if not config.Skills.VoidKill then return end
+    local target = self._combat.CurrentTarget or self._combat:GetTarget(config)
+    if not target then return end
+
+    local tEntry = self._cache:GetPlayerEntry(target)
+    if not tEntry or not tEntry.IsAlive or not tEntry.RootPart then return end
+
+    -- Throttle: only trigger once every 3 seconds
+    local now = os.clock()
+    if (now - (self._lastVoidKillTick or 0)) < 3 then return end
+    self._lastVoidKillTick = now
+
+    local root = tEntry.RootPart
+    local originalCFrame = root.CFrame
+    local voidDepth = config.Skills.VoidDepth or -350
+
+    pcall(function()
+        root.CFrame = CFrame.new(originalCFrame.Position.X, voidDepth, originalCFrame.Position.Z)
+    end)
+
+    local returnDelay = config.Skills.VoidReturnDelay or 0.5
+    task.delay(returnDelay, function()
+        pcall(function()
+            -- Only return if still in void and still alive
+            if root and root.Parent and root.Position.Y < -100 then
+                root.CFrame = originalCFrame
+            end
+        end)
+    end)
+end
+
 return Skills

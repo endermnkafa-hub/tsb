@@ -92,6 +92,11 @@ local ConfigSchema = {
         RecordAnimations   = { Type = "boolean", Default = true },
         RecordAttributes   = { Type = "boolean", Default = true },
         RecordCooldowns    = { Type = "boolean", Default = true },
+        RecordSounds       = { Type = "boolean", Default = true },
+        RecordTools        = { Type = "boolean", Default = true },
+        RecordRemotes      = { Type = "boolean", Default = true },
+        RecordCorrelations = { Type = "boolean", Default = true },
+        MaxCombatEvents    = { Type = "number",  Default = 1000, Min = 100, Max = 5000 },
     },
     Keybinds = {
         ToggleGUI          = { Type = "EnumItem", EnumType = Enum.KeyCode, Default = Enum.KeyCode.RightControl },

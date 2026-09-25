@@ -51,13 +51,19 @@ function DiagnosticsTab.Build(parent: Instance, ctx: any)
     end
 
     -- TSB Live Telemetry & Game Data Auto-Recorder
-    Components.Section(parent, "TSB Game Data & Combat Telemetry Auto-Recorder", accent)
-    local teleStats = diag.Telemetry or { TotalAnimations = 0, TotalAttributes = 0, TotalEvents = 0, TotalHitboxProfiles = 0, TotalCooldownProfiles = 0 }
+    Components.Section(parent, "TSB Game Data & Comprehensive Combat Telemetry", accent)
+    local teleStats = diag.Telemetry or {}
     
-    local animBadge = Components.StatusBadge(parent, "Animations Logged (All Players)", tostring(teleStats.TotalAnimations or 0), Theme.Colors.Success)
-    local attrBadge = Components.StatusBadge(parent, "Attributes Tracked (0ms States)", tostring(teleStats.TotalAttributes or 0), Theme.Colors.Info)
-    local eventBadge = Components.StatusBadge(parent, "Combat & Ragdoll Events", tostring(teleStats.TotalEvents or 0), Theme.Colors.Warning)
+    local animBadge = Components.StatusBadge(parent, "Animations Logged", tostring(teleStats.TotalAnimations or 0), Theme.Colors.Success)
+    local charBadge = Components.StatusBadge(parent, "Character Profiles", tostring(teleStats.TotalCharacters or 0), Theme.Colors.Info)
+    local hitboxBadge = Components.StatusBadge(parent, "Hitbox Profiles (Rig/Parts)", tostring(teleStats.TotalHitboxProfiles or 0), Theme.Colors.Success)
+    local attrBadge = Components.StatusBadge(parent, "Attributes Tracked", tostring(teleStats.TotalAttributes or 0), Theme.Colors.Info)
+    local corrBadge = Components.StatusBadge(parent, "Correlations Discovered", tostring(teleStats.TotalCorrelations or 0), Theme.Colors.Success)
+    local eventBadge = Components.StatusBadge(parent, "Combat & Ragdoll Events", tostring(teleStats.TotalCombatEvents or teleStats.TotalEvents or 0), Theme.Colors.Warning)
     local cdBadge = Components.StatusBadge(parent, "Skill Cooldown Profiles", tostring(teleStats.TotalCooldownProfiles or 0), Theme.Colors.TextPrimary)
+    local soundBadge = Components.StatusBadge(parent, "Sounds Cataloged", tostring(teleStats.TotalSounds or 0), Theme.Colors.TextPrimary)
+    local toolBadge = Components.StatusBadge(parent, "Tools & Accessories", tostring(teleStats.TotalTools or 0), Theme.Colors.TextSecondary)
+    local remoteBadge = Components.StatusBadge(parent, "Remotes & Objects Found", tostring(teleStats.TotalRemotes or 0), Theme.Colors.Info)
 
     local cfg_diag = ctx.ConfigManager.Config
     Components.Toggle(parent, "Auto-Record All Player Data", "Enable continuous live telemetry capture from all players", cfg_diag.Telemetry and cfg_diag.Telemetry.AutoRecordData or false, accent, function(val)
@@ -65,18 +71,39 @@ function DiagnosticsTab.Build(parent: Instance, ctx: any)
         notifs:Show("Telemetry", val and "Live combat data recording ACTIVE." or "Data recording paused.", 2.0, val and "Success" or "Warning")
     end)
 
-    Components.Button(parent, "Force Save Data to Disk (tsb_combat_data.json)", "Save Telemetry Now", "Primary", accent, function()
+    Components.Button(parent, "Force Save Data to Disk (tsb_data/ & tsb_combat_data.json)", "Save Telemetry Now", "Primary", accent, function()
         if bootstrap and bootstrap.Container and bootstrap.Container:Has("TelemetryRecorder") then
             local recorder = bootstrap.Container:Get("TelemetryRecorder")
             recorder:SaveToDisk(true)
             local st = recorder:GetStats()
             animBadge.Update(tostring(st.TotalAnimations), Theme.Colors.Success)
+            charBadge.Update(tostring(st.TotalCharacters), Theme.Colors.Info)
+            hitboxBadge.Update(tostring(st.TotalHitboxProfiles), Theme.Colors.Success)
             attrBadge.Update(tostring(st.TotalAttributes), Theme.Colors.Info)
-            eventBadge.Update(tostring(st.TotalEvents), Theme.Colors.Warning)
+            corrBadge.Update(tostring(st.TotalCorrelations), Theme.Colors.Success)
+            eventBadge.Update(tostring(st.TotalCombatEvents), Theme.Colors.Warning)
             cdBadge.Update(tostring(st.TotalCooldownProfiles), Theme.Colors.TextPrimary)
-            notifs:Show("Telemetry", string.format("Saved %d anims & %d attrs to tsb_combat_data.json!", st.TotalAnimations, st.TotalAttributes), 3.0, "Success")
+            soundBadge.Update(tostring(st.TotalSounds), Theme.Colors.TextPrimary)
+            toolBadge.Update(tostring(st.TotalTools), Theme.Colors.TextSecondary)
+            remoteBadge.Update(tostring(st.TotalRemotes), Theme.Colors.Info)
+            notifs:Show("Telemetry", string.format("Saved dataset (%d anims, %d chars, %d hitboxes) to disk!", st.TotalAnimations, st.TotalCharacters, st.TotalHitboxProfiles), 3.0, "Success")
         else
             notifs:Show("Telemetry", "TelemetryRecorder service not ready.", 2.5, "Error")
+        end
+    end)
+
+    Components.Button(parent, "Export Telemetry Summary", "Export Summary", "Secondary", accent, function()
+        if bootstrap and bootstrap.Container and bootstrap.Container:Has("TelemetryRecorder") then
+            local recorder = bootstrap.Container:Get("TelemetryRecorder")
+            local summary = recorder:ExportSummary()
+            pcall(function()
+                if typeof(setclipboard) == "function" then
+                    setclipboard(summary)
+                    notifs:Show("Telemetry Export", "Summary copied to clipboard!\n" .. summary, 4.0, "Success")
+                    return
+                end
+            end)
+            notifs:Show("Telemetry Export", summary, 4.0, "Info")
         end
     end)
 
@@ -127,9 +154,15 @@ function DiagnosticsTab.Build(parent: Instance, ctx: any)
 
             local freshTele = fresh.Telemetry or {}
             animBadge.Update(tostring(freshTele.TotalAnimations or 0), Theme.Colors.Success)
+            charBadge.Update(tostring(freshTele.TotalCharacters or 0), Theme.Colors.Info)
+            hitboxBadge.Update(tostring(freshTele.TotalHitboxProfiles or 0), Theme.Colors.Success)
             attrBadge.Update(tostring(freshTele.TotalAttributes or 0), Theme.Colors.Info)
-            eventBadge.Update(tostring(freshTele.TotalEvents or 0), Theme.Colors.Warning)
+            corrBadge.Update(tostring(freshTele.TotalCorrelations or 0), Theme.Colors.Success)
+            eventBadge.Update(tostring(freshTele.TotalCombatEvents or freshTele.TotalEvents or 0), Theme.Colors.Warning)
             cdBadge.Update(tostring(freshTele.TotalCooldownProfiles or 0), Theme.Colors.TextPrimary)
+            soundBadge.Update(tostring(freshTele.TotalSounds or 0), Theme.Colors.TextPrimary)
+            toolBadge.Update(tostring(freshTele.TotalTools or 0), Theme.Colors.TextSecondary)
+            remoteBadge.Update(tostring(freshTele.TotalRemotes or 0), Theme.Colors.Info)
 
             for fName, b in pairs(featureBadges) do
                 local fs = fresh.FeatureStates[fName]

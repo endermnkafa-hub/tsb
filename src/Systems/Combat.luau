@@ -188,6 +188,11 @@ function Combat:UpdateAutoM1(config: any)
     local tEntry = self._cache:GetPlayerEntry(target)
     if not myEntry or not myEntry.RootPart or not tEntry or not tEntry.RootPart then return end
 
+    -- AntiCounterBait: don't attack while enemy is in counter stance
+    if config.Combat.AntiCounterBait and self._enemyState:IsEnemyInCounterStance(target) then
+        return
+    end
+
     local dist = (myEntry.RootPart.Position - tEntry.RootPart.Position).Magnitude
     if dist <= 14 then
         -- Natural FSM State Management
@@ -196,9 +201,36 @@ function Combat:UpdateAutoM1(config: any)
         end
 
         local now = os.clock()
+        local enemyData = self._enemyState and self._enemyState:Get(target)
+
+        -- Frame Trap Wakeup: if enemy is ragdolled, wait for the exact getup recovery frame
+        if enemyData and enemyData.IsRagdoll then
+            if config.Combat.FrameTrapWakeup and enemyData.WakeupTime > 0 then
+                if now >= (enemyData.WakeupTime - 0.15) and now <= (enemyData.WakeupTime + 0.35) then
+                    if (now - self.LastAttackTick) >= (config.Combat.AutoM1Delay or 0.12) then
+                        self.LastAttackTick = now
+                        self.M1ComboCount = 1
+                        SafeMouseClick()
+                    end
+                end
+            end
+            return -- Do not waste attacks while enemy is invincible on ground
+        end
+
         if (now - self.LastAttackTick) >= (config.Combat.AutoM1Delay or 0.12) then
             self.LastAttackTick = now
             self.M1ComboCount = (self.M1ComboCount % 4) + 1
+
+            -- AutoComboSequencer: execute combo timings (e.g. 3 M1s + pause / skill window)
+            if config.Combat.AutoComboSequencer and self.M1ComboCount == 3 then
+                -- 3rd M1 executed; delay 4th slightly or trigger downtilt/uptilt jump
+                pcall(function()
+                    if myEntry.Humanoid then
+                        myEntry.Humanoid.Jump = true
+                    end
+                end)
+            end
+
             SafeMouseClick()
         end
     end
@@ -294,6 +326,117 @@ function Combat:ResetHitboxes()
                 end)
             end
         end
+    end
+end
+
+function Combat:UpdateAntiRagdoll(config: any)
+    if not config.Combat.AntiRagdoll then return end
+    local entry = self._cache:GetPlayerEntry(LocalPlayer)
+    if not entry or not entry.Humanoid then return end
+    local state = entry.Humanoid:GetState()
+    if state == Enum.HumanoidStateType.Physics or state == Enum.HumanoidStateType.FallingDown then
+        pcall(function() entry.Humanoid:ChangeState(Enum.HumanoidStateType.Running) end)
+    end
+end
+
+function Combat:UpdateAutoEvasive(config: any)
+    if not config.Combat.AutoEvasive then return end
+    local myEntry = self._cache:GetPlayerEntry(LocalPlayer)
+    if not myEntry or not myEntry.RootPart then return end
+    local myPos = myEntry.RootPart.Position
+    local cam = game:GetService("Workspace").CurrentCamera
+    if not cam then return end
+
+    local now = os.clock()
+    if (now - (self._lastEvasiveTick or 0)) < 0.5 then return end
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player == LocalPlayer then continue end
+        local tEntry = self._cache:GetPlayerEntry(player)
+        if not tEntry or not tEntry.IsAlive or not tEntry.RootPart then continue end
+        local dist = (tEntry.RootPart.Position - myPos).Magnitude
+        if dist > 12 then continue end
+
+        -- Check if enemy is actively attacking
+        local isAttacking = false
+        local tChar = tEntry.Character
+        if tChar then
+            if tChar:GetAttribute("HoldingM1") or tChar:GetAttribute("HoldingNormalPunch")
+                or tChar:GetAttribute("HoldingConsecutivePunches") then
+                isAttacking = true
+            end
+        end
+        if not isAttacking and tEntry.Animator then
+            for _, track in ipairs(tEntry.Animator:GetPlayingAnimationTracks()) do
+                local name = (track.Name or ""):lower()
+                if name:find("attack") or name:find("punch") or name:find("strike") then
+                    isAttacking = true
+                    break
+                end
+            end
+        end
+
+        if isAttacking then
+            self._lastEvasiveTick = now
+            -- Alternate dodge direction each time
+            self._evasiveSide = not self._evasiveSide
+            local sideDir = self._evasiveSide and cam.CFrame.RightVector or -cam.CFrame.RightVector
+            pcall(function()
+                myEntry.RootPart.AssemblyLinearVelocity = Vector3.new(
+                    sideDir.X * 40,
+                    myEntry.RootPart.AssemblyLinearVelocity.Y,
+                    sideDir.Z * 40
+                )
+            end)
+            break
+        end
+    end
+end
+
+function Combat:StartMassBring(config: any)
+    if self.MassBringActive then return end
+    self.MassBringActive = true
+    self._massBringStart = os.clock()
+    self._eventBus:Publish("Combat.MassBringStarted")
+end
+
+function Combat:StopMassBring()
+    if not self.MassBringActive then return end
+    self.MassBringActive = false
+    self._massBringStart = nil
+    self._eventBus:Publish("Combat.MassBringStopped")
+end
+
+function Combat:UpdateMassBring(config: any)
+    if not self.MassBringActive then return end
+    local myEntry = self._cache:GetPlayerEntry(LocalPlayer)
+    if not myEntry or not myEntry.RootPart then self:StopMassBring() return end
+
+    -- Auto-stop after duration
+    local duration = config.Combat.MassBringDuration or 5
+    if (os.clock() - (self._massBringStart or 0)) > duration then
+        self:StopMassBring()
+        return
+    end
+
+    local myPos = myEntry.RootPart.Position
+    local radius = 6
+    local idx = 0
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player == LocalPlayer then continue end
+        local tEntry = self._cache:GetPlayerEntry(player)
+        if not tEntry or not tEntry.IsAlive or not tEntry.RootPart then continue end
+        local dist = (tEntry.RootPart.Position - myPos).Magnitude
+        if dist > (config.Combat.AimMaxRange or 300) then continue end
+
+        -- Arrange players in a circle around local player
+        local angle = (idx * (2 * math.pi)) / math.max(#Players:GetPlayers() - 1, 1)
+        local targetPos = myPos + Vector3.new(math.cos(angle) * radius, 0, math.sin(angle) * radius)
+        pcall(function()
+            tEntry.RootPart.CFrame = CFrame.new(targetPos + Vector3.new(0, 3, 0))
+        end)
+        idx += 1
     end
 end
 

@@ -95,4 +95,13 @@ function Profiler:UpdateSystemMetrics()
     end
 end
 
+function Profiler:GetReport(): { [string]: any }
+    return {
+        FPS = self.CurrentFPS,
+        MemoryKB = self.MemoryKB,
+        PingMS = self.PingMS,
+        Metrics = self.Metrics,
+    }
+end
+
 return Profiler

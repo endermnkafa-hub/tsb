@@ -223,6 +223,22 @@ function UIController:Init()
                 if cfg.Movement then cfg.Movement.Fly = false; cfg.Movement.Noclip = false end
                 if cfg.Combat then cfg.Combat.Aimlock = false; cfg.Combat.AutoM1 = false end
                 self:ShowNotification("🛑 Emergency Stop", "All active combat & movement loops stopped.", 2.5, "Warning")
+            elseif input.KeyCode == (kb.MassBringKey or Enum.KeyCode.G) then
+                if self._deps.Container and self._deps.Container:Has("Combat") then
+                    local combat = self._deps.Container:Get("Combat")
+                    if combat.MassBringActive then
+                        combat:StopMassBring()
+                        self:ShowNotification("Mass Bring", "Mass Bring STOPPED", 2.0, "Warning")
+                    else
+                        combat:StartMassBring(cfg)
+                        self:ShowNotification("Mass Bring", "Mass Bring STARTED", 2.0, "Success")
+                    end
+                end
+            elseif input.KeyCode == (kb.ToggleSkyDodge or Enum.KeyCode.H) then
+                if cfg.Survival then
+                    cfg.Survival.SkyDodge = not cfg.Survival.SkyDodge
+                    self:ShowNotification("Sky Dodge", cfg.Survival.SkyDodge and "Sky Dodge ENABLED" or "Sky Dodge DISABLED", 2.0, cfg.Survival.SkyDodge and "Success" or "Warning")
+                end
             end
         end
     end)

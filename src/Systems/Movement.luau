@@ -71,10 +71,21 @@ function Movement:UpdateFly(dt: number, config: any)
     if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then moveDir -= Vector3.new(0, 1, 0) end
 
     local root = entry.RootPart
-    root.AssemblyLinearVelocity = Vector3.zero
     root.AssemblyAngularVelocity = Vector3.zero
-    if moveDir.Magnitude > 0 then
-        root.CFrame = root.CFrame + (moveDir.Unit * speed * (dt or 0.016))
+
+    if config.Movement.FlyMode == "Velocity" then
+        -- Physics-based velocity flight (smoother, less warpy)
+        if moveDir.Magnitude > 0 then
+            root.AssemblyLinearVelocity = moveDir.Unit * speed
+        else
+            root.AssemblyLinearVelocity = root.AssemblyLinearVelocity * 0.85 -- dampen
+        end
+    else
+        -- CFrame-based flight (default, precise)
+        root.AssemblyLinearVelocity = Vector3.zero
+        if moveDir.Magnitude > 0 then
+            root.CFrame = root.CFrame + (moveDir.Unit * speed * (dt or 0.016))
+        end
     end
 end
 
